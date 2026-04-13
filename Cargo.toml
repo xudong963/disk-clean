@@ -1,0 +1,10 @@
+[package]
+name = "disk-clean"
+version = "0.1.0"
+edition = "2021"
+description = "Find and clean up Rust project target directories to reclaim disk space"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+jwalk = "0.8"
+rayon = "1"
