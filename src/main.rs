@@ -1,9 +1,10 @@
 use clap::Parser;
-use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::process::Command;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "disk-clean", about = "Find and clean up Rust project target directories")]
@@ -41,31 +42,40 @@ fn main() {
         std::process::exit(1);
     }
 
-    let found = AtomicUsize::new(0);
+    let spin = ProgressBar::new_spinner();
+    spin.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap(),
+    );
+    spin.enable_steady_tick(Duration::from_millis(80));
+    spin.set_message("Scanning ...");
 
     let mut targets = Vec::new();
-    find_rust_targets(&root, 0, cli.max_depth, &mut targets, &found);
+    find_rust_targets(&root, 0, cli.max_depth, &mut targets, &spin);
 
-    eprintln!("\rScanning ... found {} target directories", targets.len());
-    eprint!("Calculating sizes ...");
-
-    // Calculate sizes in parallel using rayon
-    let mut entries: Vec<(PathBuf, u64)> = targets
-        .into_par_iter()
-        .map(|p| {
-            let size = dir_size(&p);
-            (p, size)
-        })
-        .collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
-
-    eprintln!(" done");
-    println!();
-
-    if entries.is_empty() {
-        println!("No Rust target directories found.");
+    if targets.is_empty() {
+        spin.finish_with_message("No Rust target directories found.");
         return;
     }
+
+    spin.finish_and_clear();
+
+    // Size calculation phase
+    let pb = ProgressBar::new(targets.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.cyan} Calculating sizes [{bar:30.cyan/dim}] {pos}/{len}")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    pb.enable_steady_tick(Duration::from_millis(80));
+
+    let sizes = du_sizes_with_progress(&targets, &pb);
+    pb.finish_and_clear();
+
+    let mut entries: Vec<(PathBuf, u64)> = targets.into_iter().zip(sizes).collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
 
     let total: u64 = entries.iter().map(|(_, s)| *s).sum();
 
@@ -98,21 +108,32 @@ fn main() {
         }
     }
 
+    let del_pb = ProgressBar::new(entries.len() as u64);
+    del_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.red} Deleting [{bar:30.red/dim}] {pos}/{len} ({msg})")
+            .unwrap()
+            .progress_chars("=> "),
+    );
+    del_pb.enable_steady_tick(Duration::from_millis(80));
+
     let mut freed: u64 = 0;
     let mut errors = 0;
     for (path, size) in &entries {
+        del_pb.set_message(format!("{}", human_size(freed)));
         match fs::remove_dir_all(path) {
-            Ok(()) => {
-                println!("Deleted: {} ({})", path.display(), human_size(*size));
-                freed += size;
-            }
+            Ok(()) => freed += size,
             Err(e) => {
-                eprintln!("Failed to delete {}: {}", path.display(), e);
+                del_pb.suspend(|| {
+                    eprintln!("Failed to delete {}: {}", path.display(), e);
+                });
                 errors += 1;
             }
         }
+        del_pb.inc(1);
     }
 
+    del_pb.finish_and_clear();
     println!();
     println!("Freed: {}", human_size(freed));
     if errors > 0 {
@@ -120,31 +141,27 @@ fn main() {
     }
 }
 
-/// Recursively find `target/` directories that sit next to a `Cargo.toml`.
+/// Walk directories looking for Cargo.toml + target/ pairs.
+/// Only reads directory listings — never stats files, never descends into target/.
 fn find_rust_targets(
     dir: &Path,
     depth: usize,
     max_depth: usize,
     results: &mut Vec<PathBuf>,
-    found: &AtomicUsize,
+    spinner: &ProgressBar,
 ) {
     if depth > max_depth {
         return;
     }
 
+    // Show the directory currently being scanned
     if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
-        if name.starts_with('.') || name == "node_modules" || name == "Library" {
-            return;
+        let found = results.len();
+        if found > 0 {
+            spinner.set_message(format!("scanning {name} ... found {found}"));
+        } else {
+            spinner.set_message(format!("scanning {name} ..."));
         }
-    }
-
-    let has_cargo_toml = dir.join("Cargo.toml").is_file();
-    let target_dir = dir.join("target");
-
-    if has_cargo_toml && target_dir.is_dir() {
-        let n = found.fetch_add(1, Ordering::Relaxed) + 1;
-        eprint!("\rScanning ... found {:<6}", n);
-        results.push(target_dir);
     }
 
     let entries = match fs::read_dir(dir) {
@@ -152,30 +169,97 @@ fn find_rust_targets(
         Err(_) => return,
     };
 
+    let mut has_cargo_toml = false;
+    let mut has_target = false;
+    let mut subdirs = Vec::new();
+
     for entry in entries.flatten() {
-        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        // Skip symlinks entirely
+        if ft.is_symlink() {
             continue;
         }
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name();
+
+        let name = entry.file_name();
+
+        if ft.is_dir() {
             if name == "target" {
-                continue;
+                has_target = true;
+            } else {
+                // Skip directories that will never contain Rust projects
+                let n = name.to_string_lossy();
+                if !should_skip(&n) {
+                    subdirs.push(entry.path());
+                }
             }
-            find_rust_targets(&path, depth + 1, max_depth, results, found);
+        } else if name == "Cargo.toml" {
+            has_cargo_toml = true;
         }
+    }
+
+    if has_cargo_toml && has_target {
+        results.push(dir.join("target"));
+        // Don't recurse deeper — workspace members share the root target/
+        return;
+    }
+
+    for subdir in subdirs {
+        find_rust_targets(&subdir, depth + 1, max_depth, results, spinner);
     }
 }
 
-/// Calculate total size of a directory using jwalk for parallel traversal.
-fn dir_size(path: &Path) -> u64 {
-    jwalk::WalkDir::new(path)
-        .skip_hidden(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
-        .sum()
+fn should_skip(name: &str) -> bool {
+    // Hidden directories
+    if name.starts_with('.') {
+        return true;
+    }
+    matches!(
+        name,
+        "node_modules"
+            | "Library"
+            | "cache"
+            | "Cache"
+            | "Caches"
+            | "__pycache__"
+            | "venv"
+            | ".venv"
+            | "dist"
+            | "build"
+            | "vendor"
+            | "Pods"
+            | "DerivedData"
+    )
+}
+
+fn du_sizes_with_progress(paths: &[PathBuf], pb: &ProgressBar) -> Vec<u64> {
+    paths
+        .iter()
+        .map(|p| {
+            let size = du_size(p);
+            pb.inc(1);
+            size
+        })
+        .collect()
+}
+
+fn du_size(path: &PathBuf) -> u64 {
+    Command::new("du")
+        .arg("-sk")
+        .arg(path)
+        .output()
+        .ok()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|kb| kb * 1024)
+        })
+        .unwrap_or(0)
 }
 
 fn human_size(bytes: u64) -> String {

@@ -6,5 +6,4 @@ description = "Find and clean up Rust project target directories to reclaim disk
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-jwalk = "0.8"
-rayon = "1"
+indicatif = "0.17"
