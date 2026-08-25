@@ -7,7 +7,10 @@ use std::process::Command;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "disk-clean", about = "Find and clean up Rust project target directories")]
+#[command(
+    name = "disk-clean",
+    about = "Find and clean up Rust project target directories"
+)]
 struct Cli {
     /// Root directory to scan (defaults to home directory)
     #[arg(default_value_t = default_scan_path())]
@@ -213,8 +216,9 @@ fn find_rust_targets(
 }
 
 fn should_skip(name: &str) -> bool {
-    // Hidden directories
-    if name.starts_with('.') {
+    // Most hidden directories contain caches or application data. Herdr is an
+    // exception: it stores project worktrees that can contain large Rust targets.
+    if name.starts_with('.') && name != ".herdr" {
         return true;
     }
     matches!(
@@ -275,5 +279,57 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("disk-clean-test-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn finds_target_inside_herdr_worktree() {
+        let root = TestDir::new();
+        let project = root
+            .path()
+            .join(".herdr/worktrees/rust-app-atlas/bug-finding");
+        fs::create_dir_all(project.join("target")).unwrap();
+        fs::write(project.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+
+        let mut targets = Vec::new();
+        find_rust_targets(root.path(), 0, 10, &mut targets, &ProgressBar::hidden());
+
+        assert_eq!(targets, vec![project.join("target")]);
+    }
+
+    #[test]
+    fn still_skips_other_hidden_directories() {
+        assert!(!should_skip(".herdr"));
+        assert!(should_skip(".git"));
+        assert!(should_skip(".cache"));
     }
 }
