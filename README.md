@@ -43,9 +43,9 @@ Run with --clean to delete these directories.
 
 ## How it works
 
-1. Recursively walks directories looking for `Cargo.toml` + `target/` pairs
-2. Stops recursing once a Rust project is found (workspace members share the root `target/`)
-3. Skips irrelevant directories (`.git`, `node_modules`, `cache`, `Library`, etc.)
+1. Recursively walks directories looking for `Cargo.toml` + `target/` pairs, and custom Cargo output directories containing both a regular `.rustc_info.json` file and a regular `CACHEDIR.TAG` file with a valid cache signature. Directories containing `Cargo.toml` are never selected as custom output directories.
+2. Searches `.herdr` and `.context`, including nested worktrees and custom outputs such as `.context/ordered-target`, even when the enclosing project already has a `target/`. Recognized build output directories are not searched further.
+3. Skips symlinks, other hidden directories, and irrelevant directories (`node_modules`, `cache`, `Library`, etc.)
 4. Uses system `du` for fast size calculation
 5. Shows progress with spinners and progress bars
 
