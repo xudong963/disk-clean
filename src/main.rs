@@ -1,7 +1,7 @@
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -78,12 +78,12 @@ fn main() {
     pb.finish_and_clear();
 
     let mut entries: Vec<(PathBuf, u64)> = targets.into_iter().zip(sizes).collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
     let total: u64 = entries.iter().map(|(_, s)| *s).sum();
 
-    println!("{:<10} {}", "SIZE", "PATH");
-    println!("{:<10} {}", "----", "----");
+    println!("{:<10} PATH", "SIZE");
+    println!("{:<10} ----", "----");
     for (path, size) in &entries {
         println!("{:<10} {}", human_size(*size), path.display());
     }
@@ -123,7 +123,7 @@ fn main() {
     let mut freed: u64 = 0;
     let mut errors = 0;
     for (path, size) in &entries {
-        del_pb.set_message(format!("{}", human_size(freed)));
+        del_pb.set_message(human_size(freed));
         match fs::remove_dir_all(path) {
             Ok(()) => freed += size,
             Err(e) => {
@@ -144,8 +144,9 @@ fn main() {
     }
 }
 
-/// Walk directories looking for Cargo.toml + target/ pairs.
-/// Only reads directory listings — never stats files, never descends into target/.
+/// Find Cargo.toml + target/ pairs and cache-marked Cargo output directories.
+/// Inspect directory listings and cache tag headers, but never recurse into
+/// recognized build output. Keep searching projects for independent targets.
 fn find_rust_targets(
     dir: &Path,
     depth: usize,
@@ -173,10 +174,17 @@ fn find_rust_targets(
     };
 
     let mut has_cargo_toml = false;
+    let mut has_manifest_entry = false;
     let mut has_target = false;
+    let mut has_rustc_info = false;
+    let mut has_cache_tag = false;
     let mut subdirs = Vec::new();
 
     for entry in entries.flatten() {
+        let name = entry.file_name();
+        // Even a symlinked or unreadable manifest must prevent selecting the
+        // source directory itself as a custom output directory.
+        has_manifest_entry |= name == "Cargo.toml";
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(_) => continue,
@@ -187,38 +195,63 @@ fn find_rust_targets(
             continue;
         }
 
-        let name = entry.file_name();
-
         if ft.is_dir() {
             if name == "target" {
                 has_target = true;
-            } else {
-                // Skip directories that will never contain Rust projects
-                let n = name.to_string_lossy();
-                if !should_skip(&n) {
-                    subdirs.push(entry.path());
-                }
             }
-        } else if name == "Cargo.toml" {
-            has_cargo_toml = true;
+            let n = name.to_string_lossy();
+            if !should_skip(&n) {
+                subdirs.push(entry.path());
+            }
+        } else if ft.is_file() {
+            if name == "Cargo.toml" {
+                has_cargo_toml = true;
+            } else if name == ".rustc_info.json" {
+                has_rustc_info = true;
+            } else if name == "CACHEDIR.TAG" {
+                has_cache_tag = true;
+            }
         }
+    }
+
+    // Custom output directories need both Cargo markers. Never select an
+    // entire source project, even if it also contains cache markers.
+    if !has_manifest_entry && has_rustc_info && has_cache_tag && has_valid_cache_tag(dir) {
+        results.push(dir.to_path_buf());
+        return;
+    }
+
+    // Unmarked target directories without a neighboring manifest are not
+    // safe cleanup candidates. Avoid searching their possible build output.
+    if !has_cargo_toml && dir.file_name().is_some_and(|name| name == "target") {
+        return;
     }
 
     if has_cargo_toml && has_target {
         results.push(dir.join("target"));
-        // Don't recurse deeper — workspace members share the root target/
-        return;
     }
 
     for subdir in subdirs {
+        if has_cargo_toml && subdir.file_name().is_some_and(|name| name == "target") {
+            continue;
+        }
         find_rust_targets(&subdir, depth + 1, max_depth, results, spinner);
     }
 }
 
+fn has_valid_cache_tag(dir: &Path) -> bool {
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let mut header = [0; SIGNATURE.len()];
+    fs::File::open(dir.join("CACHEDIR.TAG"))
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok()
+        && header == SIGNATURE
+}
+
 fn should_skip(name: &str) -> bool {
-    // Most hidden directories contain caches or application data. Herdr is an
-    // exception: it stores project worktrees that can contain large Rust targets.
-    if name.starts_with('.') && name != ".herdr" {
+    // Herdr worktrees and Conductor context directories can contain Rust
+    // projects and custom build outputs. Keep skipping other hidden data.
+    if name.starts_with('.') && !matches!(name, ".herdr" | ".context") {
         return true;
     }
     matches!(
@@ -311,6 +344,162 @@ mod tests {
         }
     }
 
+    fn create_project(path: &Path) {
+        fs::create_dir_all(path.join("target")).unwrap();
+        fs::write(path.join("Cargo.toml"), "[workspace]\n").unwrap();
+    }
+
+    fn create_cargo_cache(path: &Path) {
+        fs::create_dir_all(path.join("debug")).unwrap();
+        fs::write(path.join(".rustc_info.json"), "{}").unwrap();
+        fs::write(
+            path.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n\
+             # This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+    }
+
+    fn scan(path: &Path, max_depth: usize) -> Vec<PathBuf> {
+        let mut targets = Vec::new();
+        find_rust_targets(path, 0, max_depth, &mut targets, &ProgressBar::hidden());
+        targets.sort();
+        targets
+    }
+
+    #[test]
+    fn finds_custom_target_inside_context() {
+        let root = TestDir::new();
+        let target = root.path().join("dalat/.context/ordered-target");
+        create_cargo_cache(&target);
+
+        assert_eq!(scan(root.path(), 10), vec![target]);
+    }
+
+    #[test]
+    fn finds_context_targets_even_when_parent_has_target() {
+        let root = TestDir::new();
+        create_project(root.path());
+        let worktree = root.path().join(".context/pr5986-benchmark-worktree");
+        create_project(&worktree);
+        let custom_target = root.path().join(".context/ordered-target");
+        create_cargo_cache(&custom_target);
+
+        let mut expected = vec![
+            root.path().join("target"),
+            worktree.join("target"),
+            custom_target,
+        ];
+        expected.sort();
+        assert_eq!(scan(root.path(), 10), expected);
+    }
+
+    #[test]
+    fn finds_marked_target_without_adjacent_manifest() {
+        let root = TestDir::new();
+        let target = root.path().join(".context/target");
+        create_cargo_cache(&target);
+
+        assert_eq!(scan(root.path(), 10), vec![target]);
+    }
+
+    #[test]
+    fn scans_custom_target_directly_without_descending_into_artifacts() {
+        let root = TestDir::new();
+        create_cargo_cache(root.path());
+        create_project(&root.path().join("debug/generated-project"));
+
+        assert_eq!(scan(root.path(), 10), vec![root.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn does_not_descend_into_default_target() {
+        let root = TestDir::new();
+        create_project(root.path());
+        create_project(&root.path().join("target/debug/generated-project"));
+
+        assert_eq!(scan(root.path(), 10), vec![root.path().join("target")]);
+    }
+
+    #[test]
+    fn rejects_unmarked_or_incomplete_custom_targets() {
+        let root = TestDir::new();
+        for name in ["ordered-target", "rustc-only", "tag-only", "invalid-tag"] {
+            let path = root.path().join(".context").join(name);
+            create_cargo_cache(&path);
+            match name {
+                "ordered-target" => {
+                    fs::remove_file(path.join(".rustc_info.json")).unwrap();
+                    fs::remove_file(path.join("CACHEDIR.TAG")).unwrap();
+                }
+                "rustc-only" => fs::remove_file(path.join("CACHEDIR.TAG")).unwrap(),
+                "tag-only" => fs::remove_file(path.join(".rustc_info.json")).unwrap(),
+                "invalid-tag" => fs::write(
+                    path.join("CACHEDIR.TAG"),
+                    "Signature: 00000000000000000000000000000000\n",
+                )
+                .unwrap(),
+                _ => unreachable!(),
+            }
+        }
+
+        assert!(scan(root.path(), 10).is_empty());
+    }
+
+    #[test]
+    fn never_selects_project_root_as_custom_target() {
+        let root = TestDir::new();
+        create_project(root.path());
+        create_cargo_cache(root.path());
+
+        assert_eq!(scan(root.path(), 10), vec![root.path().join("target")]);
+    }
+
+    #[test]
+    fn custom_targets_respect_max_depth() {
+        let root = TestDir::new();
+        let target = root.path().join(".context/ordered-target");
+        create_cargo_cache(&target);
+
+        assert!(scan(root.path(), 1).is_empty());
+        assert_eq!(scan(root.path(), 2), vec![target]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_symlinked_targets_and_markers() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new();
+        let external = TestDir::new();
+        create_cargo_cache(external.path());
+        symlink(external.path(), root.path().join("linked-target")).unwrap();
+        for marker in [".rustc_info.json", "CACHEDIR.TAG"] {
+            let path = root.path().join(format!("linked-{marker}"));
+            create_cargo_cache(&path);
+            fs::remove_file(path.join(marker)).unwrap();
+            symlink(external.path().join(marker), path.join(marker)).unwrap();
+        }
+
+        assert!(scan(root.path(), 10).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn never_selects_project_with_symlinked_manifest() {
+        let root = TestDir::new();
+        let external = TestDir::new();
+        create_cargo_cache(root.path());
+        create_project(external.path());
+        std::os::unix::fs::symlink(
+            external.path().join("Cargo.toml"),
+            root.path().join("Cargo.toml"),
+        )
+        .unwrap();
+
+        assert!(scan(root.path(), 10).is_empty());
+    }
+
     #[test]
     fn finds_target_inside_herdr_worktree() {
         let root = TestDir::new();
@@ -329,6 +518,7 @@ mod tests {
     #[test]
     fn still_skips_other_hidden_directories() {
         assert!(!should_skip(".herdr"));
+        assert!(!should_skip(".context"));
         assert!(should_skip(".git"));
         assert!(should_skip(".cache"));
     }
